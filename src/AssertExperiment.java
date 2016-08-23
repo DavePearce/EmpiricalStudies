@@ -2,7 +2,9 @@ import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -11,6 +13,8 @@ import org.eclipse.jgit.api.errors.NoHeadException;
 import org.eclipse.jgit.api.errors.TransportException;
 import org.eclipse.jgit.diff.DiffEntry;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
+import org.eclipse.jgit.errors.MissingObjectException;
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectReader;
 import org.eclipse.jgit.lib.Repository;
@@ -132,23 +136,13 @@ public class AssertExperiment {
 	private static void classifyCommits(List<RevCommit> commits, Git git, DisplayLog log)
 			throws IncorrectObjectTypeException, IOException, GitAPIException {
 		log.startActivity("Classifying bug fixes");
-		Repository repository = git.getRepository();		
 		//
 		for (RevCommit rc : commits) {
 			List<DiffEntry> diffs = extractDiffs(rc, git, log);
+			Map<String,CompilationUnit> units = parseSourceFiles(diffs,git);
+			
 			for (DiffEntry diff : diffs) {
-				// FIXME: this is not efficient as reparses file for every diff
-				if (diff.getNewPath().endsWith(".java")) {
-					ObjectLoader loader = repository.open(diff.getNewId().toObjectId());
-					byte[] bytes = loader.getBytes();
-					ByteArrayInputStream bin = new ByteArrayInputStream(bytes);
-					try {
-						CompilationUnit jf = JavaParser.parse(bin);
-						System.out.println("PARSED: " + diff.getNewPath());
-					} catch (ParseException e) {
-						e.printStackTrace();
-					}
-				}
+				
 			}
 		}
 		log.endActivity();
@@ -180,5 +174,58 @@ public class AssertExperiment {
 			}
 		}
 		return diffs;
+	}
+
+	/**
+	 * Parse all source files related to a given selection of diffs. The reason
+	 * for doing this is that multiple diffs may refer to the same compilation
+	 * unit. Therefore, we want to ensure each source file is parsed at most
+	 * once for efficiency.
+	 * 
+	 * @param diffs
+	 * @param git
+	 * @return
+	 * @throws IOException
+	 * @throws MissingObjectException
+	 */
+	private static Map<String, CompilationUnit> parseSourceFiles(List<DiffEntry> diffs, Git git)
+			throws MissingObjectException, IOException {
+
+		HashMap<String, CompilationUnit> units = new HashMap<String, CompilationUnit>();
+		for (DiffEntry diff : diffs) {
+			String newPath = diff.getNewPath();
+			if (newPath.endsWith(".java") && !units.containsKey(newPath)) {
+				// Source file not parsed before, so parse it
+				CompilationUnit unit = parseCompilationUnit(diff.getNewId().toObjectId(),git);
+				// Cache compilation unit
+				units.put(newPath, unit);				
+			}
+		}
+		// done
+		return units;
+	}
+	
+	/**
+	 * Parse a single Java source file into a CompilationUnit. This can fail in
+	 * some ways. For example, if the parser is unable to parse the file for
+	 * whatever reason (e.g. it may be invalid).
+	 * 
+	 * @param id
+	 * @param git
+	 * @return
+	 * @throws MissingObjectException
+	 * @throws IOException
+	 */
+	private static CompilationUnit parseCompilationUnit(ObjectId id, Git git)
+			throws MissingObjectException, IOException {
+		Repository repository = git.getRepository();
+		ObjectLoader loader = repository.open(id);
+		byte[] bytes = loader.getBytes();
+		ByteArrayInputStream bin = new ByteArrayInputStream(bytes);
+		try {
+			return JavaParser.parse(bin);
+		} catch (ParseException e) {
+			return null;
+		}
 	}
 }
