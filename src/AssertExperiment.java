@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -12,19 +13,26 @@ import org.eclipse.jgit.api.errors.InvalidRemoteException;
 import org.eclipse.jgit.api.errors.NoHeadException;
 import org.eclipse.jgit.api.errors.TransportException;
 import org.eclipse.jgit.diff.DiffEntry;
+import org.eclipse.jgit.diff.DiffFormatter;
+import org.eclipse.jgit.errors.CorruptObjectException;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectReader;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.patch.FileHeader;
+import org.eclipse.jgit.patch.HunkHeader;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.treewalk.CanonicalTreeParser;
+import org.eclipse.jgit.util.io.DisabledOutputStream;
 
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParseException;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.body.MethodDeclaration;
 
 /**
  * The purpose of this class is to reproduce a simple experiment measuring the
@@ -135,15 +143,17 @@ public class AssertExperiment {
 	 */
 	private static void classifyCommits(List<RevCommit> commits, Git git, DisplayLog log)
 			throws IncorrectObjectTypeException, IOException, GitAPIException {
-		log.startActivity("Classifying bug fixes");
+		log.startActivity("Classifying bug fixes");		
 		//
 		for (RevCommit rc : commits) {
+			// Extract the diffs
 			List<DiffEntry> diffs = extractDiffs(rc, git, log);
-			Map<String,CompilationUnit> units = parseSourceFiles(diffs,git);
-			
-			for (DiffEntry diff : diffs) {
-				
-			}
+			// Parse related source files into a cache
+			Map<String, CompilationUnit> cache = parseSourceFiles(diffs, git);
+			// Extract all hunks
+			List<HunkHeader> hunks = extractHunks(diffs, git);
+			// Determine list of all methods affected by diff
+			List<MethodDeclaration> methods = determineAffectedMethods(hunks, cache);
 		}
 		log.endActivity();
 	}
@@ -206,6 +216,33 @@ public class AssertExperiment {
 	}
 	
 	/**
+	 * Extract the set of hunks mapped to their respective compilation units.
+	 * Using these, we can then start looking through the respective source
+	 * files.
+	 * 
+	 * @param diffs
+	 * @param git
+	 * @return
+	 * @throws IOException 
+	 * @throws MissingObjectException 
+	 * @throws CorruptObjectException 
+	 */
+	public static List<HunkHeader> extractHunks(List<DiffEntry> diffs, Git git) throws CorruptObjectException, MissingObjectException, IOException {
+		ArrayList<HunkHeader> hunks = new ArrayList<HunkHeader>();
+		// Configure the diff formatter.  This is kinda ugly!
+		try (DiffFormatter diffFormatter = new DiffFormatter(DisabledOutputStream.INSTANCE)) {
+			diffFormatter.setRepository(git.getRepository());
+			diffFormatter.setContext(0);
+			// Now, go through each diff extracting the hunk(s)
+			for (DiffEntry diff : diffs) {
+				FileHeader fh = diffFormatter.toFileHeader(diff);
+				hunks.addAll(fh.getHunks());				
+			}
+		}
+		return hunks;
+	}
+	
+	/**
 	 * Parse a single Java source file into a CompilationUnit. This can fail in
 	 * some ways. For example, if the parser is unable to parse the file for
 	 * whatever reason (e.g. it may be invalid).
@@ -227,5 +264,45 @@ public class AssertExperiment {
 		} catch (ParseException e) {
 			return null;
 		}
+	}
+	
+	/**
+	 * For each change determine which methods (if any) enclose it.
+	 * 
+	 * @param hunks
+	 * @param cache
+	 * @return
+	 */
+	private static List<MethodDeclaration> determineAffectedMethods(List<HunkHeader> hunks, Map<String,CompilationUnit> cache) {
+		ArrayList<MethodDeclaration> methods = new ArrayList<MethodDeclaration>();
+		for(HunkHeader hunk : hunks) {
+			CompilationUnit unit = cache.get(hunk.getFileHeader().getNewPath());
+			// Check whether this compilation unit exists. It might not if there
+			// was a problem parsing it.
+			if (unit != null) {
+				MethodDeclaration method = findEnclosingMethod(hunk, unit);
+				if (method != null) {
+					methods.add(method);
+				}
+			}
+		}
+		return methods;
+	}
+	
+	/**
+	 * Determine the enclosing method for a given change, or null if no such
+	 * method.
+	 * 
+	 * @param header
+	 * @param c
+	 * @return
+	 */
+	private static MethodDeclaration findEnclosingMethod(HunkHeader header, CompilationUnit c) {
+		Node n = c.getParentNode();
+		return findEnclosingMethod(n,header,c);
+	}
+	
+	private static MethodDeclaration findEnclosingMethod(Node n, HunkHeader header, CompilationUnit c) {
+		// Need to do stuff here
 	}
 }
