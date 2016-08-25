@@ -5,7 +5,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -30,9 +29,12 @@ import org.eclipse.jgit.util.io.DisabledOutputStream;
 
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParseException;
-import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.Node;
-import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.*;
+import com.github.javaparser.ast.body.*;
+import com.github.javaparser.ast.comments.*;
+import com.github.javaparser.ast.expr.*;
+import com.github.javaparser.ast.stmt.*;
+import com.github.javaparser.ast.type.*;
 
 /**
  * The purpose of this class is to reproduce a simple experiment measuring the
@@ -47,15 +49,32 @@ public class AssertExperiment {
 
 	private static String[] repositories = { "file:///Users/djp/projects/Jasm/" };
 
-	public static void main(String[] args) {
-		DisplayLog log = new DisplayLog(System.out);
+	private static class Results {
+		public int commits;
+		public int fixCommits;
+		public int methodsAffectedByFixCommits;
+		public int methodsOfInterestAffectedByFixCommits;
+	}
 
+	public static void main(String[] args) {
 		try {
+			Results results = new Results();
 			for (String repo : repositories) {
-				Git git = cloneGitRepository(repo, log);
-				List<RevCommit> fixes = extractBugFixCommits(git, log);
-				classifyCommits(fixes, git, log);
+				long start = System.currentTimeMillis();
+				System.out.println("Cloning repository " + repo + " ... ");
+				Git git = cloneGitRepository(repo);
+				System.out.println("Extracting commits from " + repo + " ... ");
+				List<RevCommit> fixes = extractBugFixCommits(git,results);
+				System.out.println("Classifying commits from " + repo + " ... ");
+				classifyCommits(fixes, git, results);
+				long end = System.currentTimeMillis();
+				System.out.println("Finished " + repo + " (" + (end - start) + "ms)");
 			}
+
+			System.out.println("Found " + results.commits + " commit(s)");
+			System.out.println("Found " + results.fixCommits + " fix commit(s)");
+			System.out.println("Found " + results.methodsAffectedByFixCommits + " methods affected by fix commit(s)");
+			System.out.println("Found " + results.methodsOfInterestAffectedByFixCommits + " methods of interest affected by fix commit(s)");
 		} catch (Exception e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
@@ -75,9 +94,8 @@ public class AssertExperiment {
 	 * @throws TransportException
 	 * @throws GitAPIException
 	 */
-	private static Git cloneGitRepository(String URI, DisplayLog log)
+	private static Git cloneGitRepository(String URI)
 			throws IOException, InvalidRemoteException, TransportException, GitAPIException {
-		log.startActivity("Cloning repository " + URI);
 		// Create a new temporary directory
 		File tmpdir = File.createTempFile("tmp", "");
 		// Delete that directory, should it already exist.
@@ -85,7 +103,6 @@ public class AssertExperiment {
 		// Clone the repository into the given directory
 		Git git = Git.cloneRepository().setURI(URI).setDirectory(tmpdir).call();
 		// Done
-		log.endActivity();
 		return git;
 	}
 
@@ -99,9 +116,7 @@ public class AssertExperiment {
 	 * @throws NoHeadException
 	 * @throws GitAPIException
 	 */
-	public static List<RevCommit> extractBugFixCommits(Git git, DisplayLog log)
-			throws NoHeadException, GitAPIException {
-		log.startActivity("Extracting commits");
+	public static List<RevCommit> extractBugFixCommits(Git git, Results results) throws NoHeadException, GitAPIException {
 		// Get the log of all commits
 		Iterable<RevCommit> revlog = git.log().call();
 		// Iterate and classify each commit
@@ -109,10 +124,12 @@ public class AssertExperiment {
 		for (RevCommit rc : revlog) {
 			if (isBugFixCommit(rc)) {
 				commits.add(rc);
+				results.fixCommits++;
+			} else {
+				results.commits++;
 			}
 		}
 		// Done
-		log.endActivity();
 		return commits;
 	}
 
@@ -141,21 +158,26 @@ public class AssertExperiment {
 	 * @throws IOException
 	 * @throws GitAPIException
 	 */
-	private static void classifyCommits(List<RevCommit> commits, Git git, DisplayLog log)
+	private static void classifyCommits(List<RevCommit> commits, Git git, Results results)
 			throws IncorrectObjectTypeException, IOException, GitAPIException {
-		log.startActivity("Classifying bug fixes");		
 		//
 		for (RevCommit rc : commits) {
 			// Extract the diffs
-			List<DiffEntry> diffs = extractDiffs(rc, git, log);
+			List<DiffEntry> diffs = extractDiffs(rc, git);
 			// Parse related source files into a cache
 			Map<String, CompilationUnit> cache = parseSourceFiles(diffs, git);
 			// Extract all hunks
 			List<HunkHeader> hunks = extractHunks(diffs, git);
 			// Determine list of all methods affected by diff
 			List<MethodDeclaration> methods = determineAffectedMethods(hunks, cache);
+			// Classify affected methods
+			results.methodsAffectedByFixCommits += methods.size();
+			for(MethodDeclaration method : methods) {
+				if(isOfInterest(method)) {
+					results.methodsOfInterestAffectedByFixCommits++;
+				}
+			}
 		}
-		log.endActivity();
 	}
 
 	/**
@@ -169,7 +191,7 @@ public class AssertExperiment {
 	 * @throws IOException
 	 * @throws GitAPIException
 	 */
-	private static List<DiffEntry> extractDiffs(RevCommit commit, Git git, DisplayLog log)
+	private static List<DiffEntry> extractDiffs(RevCommit commit, Git git)
 			throws IncorrectObjectTypeException, IOException, GitAPIException {
 		ArrayList<DiffEntry> diffs = new ArrayList<DiffEntry>();
 		Repository repository = git.getRepository();
@@ -206,15 +228,15 @@ public class AssertExperiment {
 			String newPath = diff.getNewPath();
 			if (newPath.endsWith(".java") && !units.containsKey(newPath)) {
 				// Source file not parsed before, so parse it
-				CompilationUnit unit = parseCompilationUnit(diff.getNewId().toObjectId(),git);
+				CompilationUnit unit = parseCompilationUnit(diff.getNewId().toObjectId(), git);
 				// Cache compilation unit
-				units.put(newPath, unit);				
+				units.put(newPath, unit);
 			}
 		}
 		// done
 		return units;
 	}
-	
+
 	/**
 	 * Extract the set of hunks mapped to their respective compilation units.
 	 * Using these, we can then start looking through the respective source
@@ -223,25 +245,26 @@ public class AssertExperiment {
 	 * @param diffs
 	 * @param git
 	 * @return
-	 * @throws IOException 
-	 * @throws MissingObjectException 
-	 * @throws CorruptObjectException 
+	 * @throws IOException
+	 * @throws MissingObjectException
+	 * @throws CorruptObjectException
 	 */
-	public static List<HunkHeader> extractHunks(List<DiffEntry> diffs, Git git) throws CorruptObjectException, MissingObjectException, IOException {
+	public static List<HunkHeader> extractHunks(List<DiffEntry> diffs, Git git)
+			throws CorruptObjectException, MissingObjectException, IOException {
 		ArrayList<HunkHeader> hunks = new ArrayList<HunkHeader>();
-		// Configure the diff formatter.  This is kinda ugly!
+		// Configure the diff formatter. This is kinda ugly!
 		try (DiffFormatter diffFormatter = new DiffFormatter(DisabledOutputStream.INSTANCE)) {
 			diffFormatter.setRepository(git.getRepository());
 			diffFormatter.setContext(0);
 			// Now, go through each diff extracting the hunk(s)
 			for (DiffEntry diff : diffs) {
 				FileHeader fh = diffFormatter.toFileHeader(diff);
-				hunks.addAll(fh.getHunks());				
+				hunks.addAll(fh.getHunks());
 			}
 		}
 		return hunks;
 	}
-	
+
 	/**
 	 * Parse a single Java source file into a CompilationUnit. This can fail in
 	 * some ways. For example, if the parser is unable to parse the file for
@@ -265,7 +288,7 @@ public class AssertExperiment {
 			return null;
 		}
 	}
-	
+
 	/**
 	 * For each change determine which methods (if any) enclose it.
 	 * 
@@ -273,14 +296,15 @@ public class AssertExperiment {
 	 * @param cache
 	 * @return
 	 */
-	private static List<MethodDeclaration> determineAffectedMethods(List<HunkHeader> hunks, Map<String,CompilationUnit> cache) {
+	private static List<MethodDeclaration> determineAffectedMethods(List<HunkHeader> hunks,
+			Map<String, CompilationUnit> cache) {
 		ArrayList<MethodDeclaration> methods = new ArrayList<MethodDeclaration>();
-		for(HunkHeader hunk : hunks) {
+		for (HunkHeader hunk : hunks) {
 			CompilationUnit unit = cache.get(hunk.getFileHeader().getNewPath());
 			// Check whether this compilation unit exists. It might not if there
 			// was a problem parsing it.
 			if (unit != null) {
-				MethodDeclaration method = findEnclosingMethod(hunk, unit);
+				MethodDeclaration method = findEnclosingMethod(unit, hunk);
 				if (method != null) {
 					methods.add(method);
 				}
@@ -288,21 +312,103 @@ public class AssertExperiment {
 		}
 		return methods;
 	}
-	
+
 	/**
 	 * Determine the enclosing method for a given change, or null if no such
 	 * method.
 	 * 
+	 * @param node
+	 *            Abstract Syntax Tree element to be explored
 	 * @param header
-	 * @param c
+	 *            Determines region for which we are looking for an enclosing
+	 *            method
 	 * @return
 	 */
-	private static MethodDeclaration findEnclosingMethod(HunkHeader header, CompilationUnit c) {
-		Node n = c.getParentNode();
-		return findEnclosingMethod(n,header,c);
+	private static MethodDeclaration findEnclosingMethod(Node node, HunkHeader header) {
+		if (node instanceof CompilationUnit || node instanceof ClassOrInterfaceDeclaration) {
+			// Definite need to explore these node kinds
+			for (Node child : node.getChildrenNodes()) {
+				MethodDeclaration m = findEnclosingMethod(child, header);
+				if (m != null) {
+					// Ok, found it
+					return m;
+				}
+			}
+		} else if (node instanceof MethodDeclaration) {
+			// This is a candidate, so check whether or not there is
+			// an overlap.
+			MethodDeclaration m = (MethodDeclaration) node;
+			if (hasSourceOverlap(m, header)) {
+				return m;
+			}
+		} else if (node instanceof PackageDeclaration || node instanceof ImportDeclaration
+				|| node instanceof BodyDeclaration || node instanceof Comment || node instanceof Type) {
+			// No need to explore these node kinds
+		} else {
+			throw new RuntimeException("unknown instanceof Node encountered: " + node.getClass().getName());
+		}
+		// Didn't find anything
+		return null;
+	}
+
+	/**
+	 * Check whether or not a given method declaration and hunk overlap. To do
+	 * this, we simply look at affected lines which is not completely accurate
+	 * (but a pretty good proxy).
+	 *
+	 * @param method
+	 * @param hunk
+	 * @return
+	 */
+	private static boolean hasSourceOverlap(MethodDeclaration method, HunkHeader hunk) {
+		int h_newEndLine = hunk.getNewStartLine() + hunk.getNewLineCount();
+		return hunk.getNewStartLine() <= method.getEndLine() && h_newEndLine >= method.getBeginLine();
+	}
+
+	/**
+	 * Determine whether or not this is a "method of interest". This is a
+	 * deliberately vague term, in order that it can be tweaked as we
+	 * investigate further.
+	 * 
+	 * @param method
+	 * @return
+	 */
+	private static boolean isOfInterest(Node node) {
+		if(node instanceof AssertStmt) {
+			// Bingo
+			return true;
+		} else if(node instanceof ThrowStmt) {
+			return isThrowNewIllegalArgumentException((ThrowStmt) node);
+		} else if (node instanceof MethodDeclaration
+				|| node instanceof Statement
+				|| node instanceof CatchClause) {
+			// Definite need to explore these node kinds
+			for (Node child : node.getChildrenNodes()) {
+				boolean r = isOfInterest(child);
+				if (r) {
+					// yes, of interest
+					return true;
+				}
+			}
+		} else if (node instanceof Comment
+				|| node instanceof Type
+				|| node instanceof Expression
+				|| node instanceof BaseParameter) {
+			// No need to explore these node kinds
+		} else {
+			System.err.println(node);
+			throw new RuntimeException("unknown instanceof Node encountered: " + node.getClass().getName());
+		}
+		// Not of interest
+		return false;
 	}
 	
-	private static MethodDeclaration findEnclosingMethod(Node n, HunkHeader header, CompilationUnit c) {
-		// Need to do stuff here
+	private static boolean isThrowNewIllegalArgumentException(ThrowStmt stmt) {
+		Expression child = stmt.getExpr();
+		if(child instanceof ObjectCreationExpr) {
+			ObjectCreationExpr e = (ObjectCreationExpr) child;
+			return e.getType().getName().equals(IllegalArgumentException.class.getSimpleName());
+		}
+		return false;
 	}
 }
