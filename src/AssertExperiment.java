@@ -13,9 +13,12 @@ import org.eclipse.jgit.api.errors.NoHeadException;
 import org.eclipse.jgit.api.errors.TransportException;
 import org.eclipse.jgit.diff.DiffEntry;
 import org.eclipse.jgit.diff.DiffFormatter;
+import org.eclipse.jgit.errors.AmbiguousObjectException;
 import org.eclipse.jgit.errors.CorruptObjectException;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
+import org.eclipse.jgit.errors.RevisionSyntaxException;
+import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectReader;
@@ -24,7 +27,10 @@ import org.eclipse.jgit.patch.FileHeader;
 import org.eclipse.jgit.patch.HunkHeader;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTree;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.treewalk.CanonicalTreeParser;
+import org.eclipse.jgit.treewalk.TreeWalk;
+import org.eclipse.jgit.treewalk.filter.PathSuffixFilter;
 import org.eclipse.jgit.util.io.DisabledOutputStream;
 
 import com.github.javaparser.JavaParser;
@@ -47,13 +53,42 @@ import com.github.javaparser.ast.type.*;
  */
 public class AssertExperiment {
 
-	private static String[] repositories = { "file:///Users/djp/projects/Jasm/" };
+	private static String[] repositories = { 
+			//"file:///Users/djp/projects/Jasm/", 
+			"file:///Users/djp/projects/Whiley/"
+			};
 
 	private static class Results {
+		/**
+		 * Counts the total number of commits processed.
+		 */
 		public int commits;
+		/**
+		 * Counts the total number of fix commits processed.
+		 */
 		public int fixCommits;
+		/**
+		 * Counts total number of methods affected by bugfix commits.
+		 */
 		public int methodsAffectedByFixCommits;
+		/**
+		 * Counts total number of methods of interest affected by fix commits.
+		 */
 		public int methodsOfInterestAffectedByFixCommits;
+		/**
+		 * Counts the total number of methods in latest revision. This is
+		 * necessary to get a feeling for the proportion of methods of interest
+		 * to methods.
+		 */
+		public int methods;
+		/**
+		 * Counts total number of methods of interest in latest revision. This
+		 * is necessary to understand the proportion of methods of interest to
+		 * normal methods. This determines what ratio of bug fix commits we
+		 * might expect to affect our methods of interest.
+		 */
+		public int methodsOfInterest;
+		
 	}
 
 	public static void main(String[] args) {
@@ -67,18 +102,34 @@ public class AssertExperiment {
 				List<RevCommit> fixes = extractBugFixCommits(git,results);
 				System.out.println("Classifying commits from " + repo + " ... ");
 				classifyCommits(fixes, git, results);
+				System.out.println("Classifing all methods from " + repo + " ... ");
+				List<MethodDeclaration> methods = extractMethods(git);
+				for(MethodDeclaration method : methods) {
+					if(isOfInterest(method)) {
+						results.methodsOfInterest++;
+					}
+					results.methods++;
+				}
 				long end = System.currentTimeMillis();
 				System.out.println("Finished " + repo + " (" + (end - start) + "ms)");
 			}
-
 			System.out.println("Found " + results.commits + " commit(s)");
 			System.out.println("Found " + results.fixCommits + " fix commit(s)");
 			System.out.println("Found " + results.methodsAffectedByFixCommits + " methods affected by fix commit(s)");
-			System.out.println("Found " + results.methodsOfInterestAffectedByFixCommits + " methods of interest affected by fix commit(s)");
+			double ratio = ratio(results.methodsOfInterestAffectedByFixCommits,results.methodsAffectedByFixCommits);
+			System.out.println("Found " + results.methodsOfInterestAffectedByFixCommits + " methods of interest affected by fix commit(s) (" + ratio + "%)");
+			System.out.println("Found " + results.methods + " method(s)");
+			ratio = ratio(results.methodsOfInterest,results.methods);
+			System.out.println("Found " + results.methodsOfInterest + " method(s) of interest (" + ratio + "%)");
 		} catch (Exception e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
+	}
+	
+	private static double ratio(int numerator, int denominator) {
+		double ratio = 10000 * ((double)numerator) / (double) denominator;
+		return Math.round(ratio) / 100d;
 	}
 
 	/**
@@ -222,7 +273,6 @@ public class AssertExperiment {
 	 */
 	private static Map<String, CompilationUnit> parseSourceFiles(List<DiffEntry> diffs, Git git)
 			throws MissingObjectException, IOException {
-
 		HashMap<String, CompilationUnit> units = new HashMap<String, CompilationUnit>();
 		for (DiffEntry diff : diffs) {
 			String newPath = diff.getNewPath();
@@ -325,8 +375,14 @@ public class AssertExperiment {
 	 * @return
 	 */
 	private static MethodDeclaration findEnclosingMethod(Node node, HunkHeader header) {
-		if (node instanceof CompilationUnit || node instanceof ClassOrInterfaceDeclaration) {
-			// Definite need to explore these node kinds
+		if (node instanceof MethodDeclaration) {
+			// This is a candidate, so check whether or not there is
+			// an overlap.
+			MethodDeclaration m = (MethodDeclaration) node;
+			if (hasSourceOverlap(m, header)) {
+				return m;
+			}
+		} else {
 			for (Node child : node.getChildrenNodes()) {
 				MethodDeclaration m = findEnclosingMethod(child, header);
 				if (m != null) {
@@ -334,18 +390,6 @@ public class AssertExperiment {
 					return m;
 				}
 			}
-		} else if (node instanceof MethodDeclaration) {
-			// This is a candidate, so check whether or not there is
-			// an overlap.
-			MethodDeclaration m = (MethodDeclaration) node;
-			if (hasSourceOverlap(m, header)) {
-				return m;
-			}
-		} else if (node instanceof PackageDeclaration || node instanceof ImportDeclaration
-				|| node instanceof BodyDeclaration || node instanceof Comment || node instanceof Type) {
-			// No need to explore these node kinds
-		} else {
-			throw new RuntimeException("unknown instanceof Node encountered: " + node.getClass().getName());
 		}
 		// Didn't find anything
 		return null;
@@ -379,9 +423,7 @@ public class AssertExperiment {
 			return true;
 		} else if(node instanceof ThrowStmt) {
 			return isThrowNewIllegalArgumentException((ThrowStmt) node);
-		} else if (node instanceof MethodDeclaration
-				|| node instanceof Statement
-				|| node instanceof CatchClause) {
+		} else {
 			// Definite need to explore these node kinds
 			for (Node child : node.getChildrenNodes()) {
 				boolean r = isOfInterest(child);
@@ -390,14 +432,6 @@ public class AssertExperiment {
 					return true;
 				}
 			}
-		} else if (node instanceof Comment
-				|| node instanceof Type
-				|| node instanceof Expression
-				|| node instanceof BaseParameter) {
-			// No need to explore these node kinds
-		} else {
-			System.err.println(node);
-			throw new RuntimeException("unknown instanceof Node encountered: " + node.getClass().getName());
 		}
 		// Not of interest
 		return false;
@@ -410,5 +444,55 @@ public class AssertExperiment {
 			return e.getType().getName().equals(IllegalArgumentException.class.getSimpleName());
 		}
 		return false;
+	}
+	
+	/**
+	 * Classify all methods in all files in a given git repository.
+	 * 
+	 * @param git
+	 * @param results
+	 * @throws RevisionSyntaxException
+	 * @throws AmbiguousObjectException
+	 * @throws IncorrectObjectTypeException
+	 * @throws IOException
+	 */
+	private static List<MethodDeclaration> extractMethods(Git git) throws RevisionSyntaxException, AmbiguousObjectException, IncorrectObjectTypeException, IOException {
+		Repository repository = git.getRepository();
+		//
+		ArrayList<MethodDeclaration> methods = new ArrayList<MethodDeclaration>();
+		// Find HEAD revision on default branch
+		ObjectId head = repository.resolve(Constants.HEAD);
+		// Read the tree at HEAD
+		try (RevWalk revWalk = new RevWalk(repository)) {
+			RevCommit commit = revWalk.parseCommit(head);
+			// Use HEAD tree to recursively walk java source files
+			RevTree tree = commit.getTree();
+			try (TreeWalk treeWalk = new TreeWalk(repository)) {
+				treeWalk.addTree(tree);
+				treeWalk.setRecursive(true);
+				treeWalk.setFilter(PathSuffixFilter.create(".java"));
+				while(treeWalk.next()) {
+					CompilationUnit cu = parseCompilationUnit(treeWalk.getObjectId(0),git);
+					extractMethods(cu,methods);
+				}
+			}
+		}
+		return methods;
+	}
+	
+	/**
+	 * Extract all methods from a given AST node.
+	 * 
+	 * @param node
+	 * @param declaration
+	 */
+	private static void extractMethods(Node node, List<MethodDeclaration> methods) {
+		if (node instanceof MethodDeclaration) {
+			methods.add((MethodDeclaration) node);
+		} else {
+			for (Node child : node.getChildrenNodes()) {
+				extractMethods(child, methods);
+			}
+		}
 	}
 }
