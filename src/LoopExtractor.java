@@ -41,40 +41,18 @@ import com.github.javaparser.ast.comments.*;
 import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.stmt.*;
 import com.github.javaparser.ast.type.*;
+import com.github.javaparser.printer.*;
+import com.github.javaparser.resolution.types.ResolvedReferenceType;
 
-/**
- * The purpose of this class is to reproduce a simple experiment measuring the
- * effect of assertions on commits. Specifically, whether or not methods
- * containing asserts have (relatively speaking) fewer or greater "bug fixing"
- * commits.
- *
- * @author David J. Pearce
- *
- */
-public class AssertExperiment {
+public class LoopExtractor {
 
 	private static String[] repositories = {
 			//"file:///Users/djp/projects/Jasm/",
-			"file:///Users/djp/projects/Whiley/"
+			"file:///Users/djp/projects/WhileyCompiler/"
+			//"file:///Users/djp/projects/StaticVariableTest/"
 			};
 
 	private static class Results {
-		/**
-		 * Counts the total number of commits processed.
-		 */
-		public int commits;
-		/**
-		 * Counts the total number of fix commits processed.
-		 */
-		public int fixCommits;
-		/**
-		 * Counts total number of methods affected by bugfix commits.
-		 */
-		public int methodsAffectedByFixCommits;
-		/**
-		 * Counts total number of methods of interest affected by fix commits.
-		 */
-		public int methodsOfInterestAffectedByFixCommits;
 		/**
 		 * Counts the total number of methods in latest revision. This is
 		 * necessary to get a feeling for the proportion of methods of interest
@@ -93,33 +71,27 @@ public class AssertExperiment {
 
 	public static void main(String[] args) {
 		try {
+			PrettyPrinter printer = new PrettyPrinter();
 			Results results = new Results();
 			for (String repo : repositories) {
 				long start = System.currentTimeMillis();
 				System.out.println("Cloning repository " + repo + " ... ");
 				Git git = cloneGitRepository(repo);
-				System.out.println("Extracting commits from " + repo + " ... ");
-				List<RevCommit> fixes = extractBugFixCommits(git,results);
-				System.out.println("Classifying commits from " + repo + " ... ");
-				classifyCommits(fixes, git, results);
 				System.out.println("Classifing all methods from " + repo + " ... ");
 				List<MethodDeclaration> methods = extractMethods(git);
 				for(MethodDeclaration method : methods) {
 					if(isOfInterest(method)) {
 						results.methodsOfInterest++;
+						System.out.println(printer.print(method));
 					}
 					results.methods++;
 				}
+
 				long end = System.currentTimeMillis();
 				System.out.println("Finished " + repo + " (" + (end - start) + "ms)");
 			}
-			System.out.println("Found " + results.commits + " commit(s)");
-			System.out.println("Found " + results.fixCommits + " fix commit(s)");
-			System.out.println("Found " + results.methodsAffectedByFixCommits + " methods affected by fix commit(s)");
-			double ratio = ratio(results.methodsOfInterestAffectedByFixCommits,results.methodsAffectedByFixCommits);
-			System.out.println("Found " + results.methodsOfInterestAffectedByFixCommits + " methods of interest affected by fix commit(s) (" + ratio + "%)");
 			System.out.println("Found " + results.methods + " method(s)");
-			ratio = ratio(results.methodsOfInterest,results.methods);
+			double ratio = ratio(results.methodsOfInterest,results.methods);
 			System.out.println("Found " + results.methodsOfInterest + " method(s) of interest (" + ratio + "%)");
 		} catch (Exception e) {
 			// TODO Auto-generated catch block
@@ -155,108 +127,6 @@ public class AssertExperiment {
 		Git git = Git.cloneRepository().setURI(URI).setDirectory(tmpdir).call();
 		// Done
 		return git;
-	}
-
-	/**
-	 * Traverse all commits in this repository and extract those which are
-	 * considered to be "bug fixes". These are commits with the word "fix" in
-	 * their short message.
-	 *
-	 * @param git
-	 * @param log
-	 * @throws NoHeadException
-	 * @throws GitAPIException
-	 */
-	public static List<RevCommit> extractBugFixCommits(Git git, Results results) throws NoHeadException, GitAPIException {
-		// Get the log of all commits
-		Iterable<RevCommit> revlog = git.log().call();
-		// Iterate and classify each commit
-		ArrayList<RevCommit> commits = new ArrayList<>();
-		for (RevCommit rc : revlog) {
-			if (isBugFixCommit(rc)) {
-				commits.add(rc);
-				results.fixCommits++;
-			} else {
-				results.commits++;
-			}
-		}
-		// Done
-		return commits;
-	}
-
-	/**
-	 * Determine whether or not a given commit is a "bug fix" or not. That is,
-	 * whether or not it contains the word "fix" in its short message.
-	 *
-	 * @param rc
-	 * @return
-	 */
-	private static boolean isBugFixCommit(RevCommit rc) {
-		String msg = rc.getShortMessage().toLowerCase();
-		return msg.contains("fix");
-	}
-
-	/**
-	 * Classify a given list of commits. This requires extracting the diffs for
-	 * each commit, parsing the affected Java source files (if any), locating
-	 * the enclosing method (if any) and determining whether or not that method
-	 * includes an instance of the assert statement.
-	 *
-	 * @param commits
-	 * @param git
-	 * @param log
-	 * @throws IncorrectObjectTypeException
-	 * @throws IOException
-	 * @throws GitAPIException
-	 */
-	private static void classifyCommits(List<RevCommit> commits, Git git, Results results)
-			throws IncorrectObjectTypeException, IOException, GitAPIException {
-		//
-		for (RevCommit rc : commits) {
-			// Extract the diffs
-			List<DiffEntry> diffs = extractDiffs(rc, git);
-			// Parse related source files into a cache
-			Map<String, CompilationUnit> cache = parseSourceFiles(diffs, git);
-			// Extract all hunks
-			List<HunkHeader> hunks = extractHunks(diffs, git);
-			// Determine list of all methods affected by diff
-			List<MethodDeclaration> methods = determineAffectedMethods(hunks, cache);
-			// Classify affected methods
-			results.methodsAffectedByFixCommits += methods.size();
-			for(MethodDeclaration method : methods) {
-				if(isOfInterest(method)) {
-					results.methodsOfInterestAffectedByFixCommits++;
-				}
-			}
-		}
-	}
-
-	/**
-	 * Extract the list of diffs that a given commit represents.
-	 *
-	 * @param commit
-	 * @param git
-	 * @param log
-	 * @return
-	 * @throws IncorrectObjectTypeException
-	 * @throws IOException
-	 * @throws GitAPIException
-	 */
-	private static List<DiffEntry> extractDiffs(RevCommit commit, Git git)
-			throws IncorrectObjectTypeException, IOException, GitAPIException {
-		ArrayList<DiffEntry> diffs = new ArrayList<>();
-		Repository repository = git.getRepository();
-		RevTree rt = commit.getTree();
-		for (RevCommit parent : commit.getParents()) {
-			try (ObjectReader reader = repository.newObjectReader()) {
-				CanonicalTreeParser oldTreeIter = new CanonicalTreeParser();
-				oldTreeIter.reset(reader, parent.getTree().getId());
-				CanonicalTreeParser newTreeIter = new CanonicalTreeParser();
-				newTreeIter.reset(reader, rt.getId());
-				diffs.addAll(git.diff().setNewTree(newTreeIter).setOldTree(oldTreeIter).call());
-			}
-		}
-		return diffs;
 	}
 
 	/**
@@ -336,78 +206,6 @@ public class AssertExperiment {
 	}
 
 	/**
-	 * For each change determine which methods (if any) enclose it.
-	 *
-	 * @param hunks
-	 * @param cache
-	 * @return
-	 */
-	private static List<MethodDeclaration> determineAffectedMethods(List<HunkHeader> hunks,
-			Map<String, CompilationUnit> cache) {
-		ArrayList<MethodDeclaration> methods = new ArrayList<>();
-		for (HunkHeader hunk : hunks) {
-			CompilationUnit unit = cache.get(hunk.getFileHeader().getNewPath());
-			// Check whether this compilation unit exists. It might not if there
-			// was a problem parsing it.
-			if (unit != null) {
-				MethodDeclaration method = findEnclosingMethod(unit, hunk);
-				if (method != null) {
-					methods.add(method);
-				}
-			}
-		}
-		return methods;
-	}
-
-	/**
-	 * Determine the enclosing method for a given change, or null if no such
-	 * method.
-	 *
-	 * @param node
-	 *            Abstract Syntax Tree element to be explored
-	 * @param header
-	 *            Determines region for which we are looking for an enclosing
-	 *            method
-	 * @return
-	 */
-	private static MethodDeclaration findEnclosingMethod(Node node, HunkHeader header) {
-		if (node instanceof MethodDeclaration) {
-			// This is a candidate, so check whether or not there is
-			// an overlap.
-			MethodDeclaration m = (MethodDeclaration) node;
-			if (hasSourceOverlap(m, header)) {
-				return m;
-			}
-		} else {
-			for (Node child : node.getChildNodes()) {
-				MethodDeclaration m = findEnclosingMethod(child, header);
-				if (m != null) {
-					// Ok, found it
-					return m;
-				}
-			}
-		}
-		// Didn't find anything
-		return null;
-	}
-
-	/**
-	 * Check whether or not a given method declaration and hunk overlap. To do
-	 * this, we simply look at affected lines which is not completely accurate
-	 * (but a pretty good proxy).
-	 *
-	 * @param method
-	 * @param hunk
-	 * @return
-	 */
-	private static boolean hasSourceOverlap(MethodDeclaration method, HunkHeader hunk) {
-		int h_newEndLine = hunk.getNewStartLine() + hunk.getNewLineCount();
-		int startLine = method.getBegin().get().line;
-		int endLine = method.getEnd().get().line;
-		return hunk.getNewStartLine() <= endLine && h_newEndLine >= startLine;
-	}
-
-	/**
 	 * Determine whether or not this is a "method of interest". This is a
 	 * deliberately vague term, in order that it can be tweaked as we
 	 * investigate further.
@@ -415,16 +213,51 @@ public class AssertExperiment {
 	 * @param method
 	 * @return
 	 */
-	private static boolean isOfInterest(Node node) {
-		if(node instanceof AssertStmt) {
-			// Bingo
-			return true;
-		} else if(node instanceof ThrowStmt) {
-			return isThrowNewIllegalArgumentException((ThrowStmt) node);
+	public static boolean isOfInterest(Node node) {
+		return containsConditional(node) && simpleEnough(node); //containsLoop(node) && simpleEnough(node);
+	}
+
+	private static boolean simpleEnough(Node node) {
+		if (!canRepresentInWhiley(node)) {
+			// Too complex
+			return false;
 		} else {
 			// Definite need to explore these node kinds
 			for (Node child : node.getChildNodes()) {
-				boolean r = isOfInterest(child);
+				boolean r = simpleEnough(child);
+				if (!r) {
+					// yes, of interest
+					return false;
+				}
+			}
+			return true;
+		}
+	}
+
+	private static boolean canRepresentInWhiley(Node node) {
+		// Statements
+		if(node instanceof ThrowStmt) {
+			return false;
+		}
+		// Expressions
+		if(node instanceof ObjectCreationExpr) {
+			return false;
+		}
+		// Types
+		if(node instanceof ClassOrInterfaceType) {
+			return false;
+		}
+		return true;
+	}
+
+	private static boolean containsLoop(Node node) {
+		if (node instanceof WhileStmt || node instanceof ForStmt) {
+			// Bingo
+			return true;
+		} else {
+			// Definite need to explore these node kinds
+			for (Node child : node.getChildNodes()) {
+				boolean r = containsLoop(child);
 				if (r) {
 					// yes, of interest
 					return true;
@@ -435,12 +268,21 @@ public class AssertExperiment {
 		return false;
 	}
 
-	private static boolean isThrowNewIllegalArgumentException(ThrowStmt stmt) {
-		Expression child = stmt.getExpression();
-		if(child instanceof ObjectCreationExpr) {
-			ObjectCreationExpr e = (ObjectCreationExpr) child;
-			return e.getType().getName().equals(IllegalArgumentException.class.getSimpleName());
+	private static boolean containsConditional(Node node) {
+		if (node instanceof IfStmt || node instanceof SwitchStmt) {
+			// Bingo
+			return true;
+		} else {
+			// Definite need to explore these node kinds
+			for (Node child : node.getChildNodes()) {
+				boolean r = containsConditional(child);
+				if (r) {
+					// yes, of interest
+					return true;
+				}
+			}
 		}
+		// Not of interest
 		return false;
 	}
 
